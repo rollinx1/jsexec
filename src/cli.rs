@@ -10,9 +10,10 @@ use url::Url;
 
 mod format;
 mod query;
+mod sourcemaps_http;
 
 #[derive(Parser)]
-#[command(version, about = "Extensible offline JavaScript analysis")]
+#[command(version, about = "Extensible JavaScript analysis")]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -73,9 +74,24 @@ enum Format {
 
 #[derive(Args)]
 struct SourceMapArgs {
-    /// Input JavaScript or saved .map/JSON files; '-' reads stdin
+    /// JavaScript/map files or HTTP(S) URLs; '-' reads stdin
     #[arg(required = true, num_args = 1..)]
-    files: Vec<PathBuf>,
+    files: Vec<String>,
+    /// Custom HTTP request header; repeat for multiple headers
+    #[arg(short = 'H', long = "header", value_name = "NAME: VALUE")]
+    headers: Vec<String>,
+    /// Fetch linked HTTP(S) maps for local/stdin inputs (requires a resolved URL)
+    #[arg(long, conflicts_with = "no_fetch")]
+    fetch: bool,
+    /// Discover references without fetching linked maps (URL inputs still download)
+    #[arg(long)]
+    no_fetch: bool,
+    /// Timeout in seconds per request, including redirects (1-86400)
+    #[arg(long, default_value_t = 30, value_parser = clap::value_parser!(u64).range(1..=86_400))]
+    timeout: u64,
+    /// Maximum decompressed response size in bytes
+    #[arg(long, default_value_t = 52_428_800, value_parser = clap::value_parser!(u64).range(1..))]
+    max_bytes: u64,
     /// Original script URL for JS input, or original map URL for a saved map
     #[arg(long)]
     base_url: Option<Url>,
@@ -215,7 +231,7 @@ fn check_strict(
 
 fn source_maps(args: SourceMapArgs) -> Result<(), Box<dyn Error>> {
     let options = sourcemaps::Options {
-        base_url: args.base_url,
+        base_url: args.base_url.clone(),
         input_kind: match args.input_type {
             SourceMapFormat::Auto => sourcemaps::InputKind::Auto,
             SourceMapFormat::Js => sourcemaps::InputKind::JavaScript,
@@ -223,7 +239,13 @@ fn source_maps(args: SourceMapArgs) -> Result<(), Box<dyn Error>> {
         },
     };
     sourcemaps::analyze(&[], &options)?;
-    protect_output(&args.files, args.output.as_deref())?;
+    let local_files: Vec<PathBuf> = args
+        .files
+        .iter()
+        .filter(|input| !sourcemaps_http::is_url(input))
+        .map(PathBuf::from)
+        .collect();
+    protect_output(&local_files, args.output.as_deref())?;
     if let Some(directory) = &args.sources_dir
         && fs::symlink_metadata(directory).is_ok()
     {
@@ -233,12 +255,11 @@ fn source_maps(args: SourceMapArgs) -> Result<(), Box<dyn Error>> {
         )
         .into());
     }
-    let sources = read_sources(args.files)?;
-    let mut report = sourcemaps::analyze(&sources, &options)?;
+    let mut report = sourcemaps_http::analyze_inputs(&args, &options)?;
     check_strict(args.strict, &report.diagnostics)?;
     if let Some(directory) = &args.sources_dir {
         if report.embedded_count() == 0 {
-            return Err("no embedded sources to write; supply a saved .map file or a script with an inline map".into());
+            return Err("no embedded sources to write; supply a map with sourcesContent, an inline map, or a URL with a linked map".into());
         }
         write_embedded_sources(&mut report, directory)?;
         let extracted: Vec<PathBuf> = report

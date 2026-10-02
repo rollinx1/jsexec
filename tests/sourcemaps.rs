@@ -317,3 +317,52 @@ fn utf8_bom_maps_and_multiple_inputs_are_supported() {
     assert_eq!(report.maps.len(), 2);
     assert_eq!(report.maps[1].input, "b.js");
 }
+
+#[test]
+fn response_headers_override_inline_annotations_without_discarded_diagnostics() {
+    let source = Source {
+        name: "https://example.com/app.js?v=1".into(),
+        code: "const a = 1;\n//# sourceMappingURL=data:application/json;base64,broken".into(),
+    };
+    let options = Options {
+        base_url: Some(Url::parse("https://example.com/app.js?v=1").unwrap()),
+        ..Options::default()
+    };
+    let report = sourcemaps::analyze_response(&source, &options, Some("app.map")).unwrap();
+    assert!(report.diagnostics.is_empty());
+    assert_eq!(report.maps[0].kind, MapKind::External);
+    assert_eq!(
+        report.maps[0].url.as_deref(),
+        Some("https://example.com/app.map")
+    );
+    assert!(report.maps[0].location.is_none());
+}
+
+#[test]
+fn remote_filenames_ignore_queries_for_format_detection() {
+    let report = analyze(
+        "https://example.com/app.js?build=1",
+        "{ const a = 1; }",
+        None,
+    );
+    assert!(report.diagnostics.is_empty());
+    assert!(report.maps.is_empty());
+}
+
+#[test]
+fn response_header_selects_javascript_for_extensionless_blocks_and_reports_empty_values() {
+    let source = Source {
+        name: "https://example.com/script".into(),
+        code: "{ const answer = 42; }".into(),
+    };
+    let options = Options {
+        base_url: Some(Url::parse(&source.name).unwrap()),
+        ..Options::default()
+    };
+    let report = sourcemaps::analyze_response(&source, &options, Some("app.map")).unwrap();
+    assert!(report.diagnostics.is_empty());
+    assert_eq!(report.maps[0].kind, MapKind::External);
+    let report = sourcemaps::analyze_response(&source, &options, Some(" ")).unwrap();
+    assert_eq!(report.diagnostics.len(), 1);
+    assert!(report.diagnostics[0].message.contains("header is empty"));
+}

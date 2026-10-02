@@ -60,7 +60,7 @@ pub struct SectionReference {
 pub struct SourceMap {
     pub input: String,
     pub kind: MapKind,
-    /// External annotation only. Inline data payloads are not duplicated in reports.
+    /// External annotation/header link. Inline data payloads are not duplicated.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reference: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -97,6 +97,25 @@ impl Report {
 
 /// Discover annotations and recover embedded sources without reading files or fetching URLs.
 pub fn analyze(sources: &[Source], options: &Options) -> Result<Report, Error> {
+    analyze_inputs(sources, options, None)
+}
+
+/// Analyze a downloaded response. A SourceMap (or legacy X-SourceMap) header
+/// overrides JavaScript annotations. The caller supplies the selected header value.
+/// Map inputs ignore the header; no network operations are performed here.
+pub fn analyze_response(
+    source: &Source,
+    options: &Options,
+    map_header: Option<&str>,
+) -> Result<Report, Error> {
+    analyze_inputs(std::slice::from_ref(source), options, map_header)
+}
+
+fn analyze_inputs(
+    sources: &[Source],
+    options: &Options,
+    map_header: Option<&str>,
+) -> Result<Report, Error> {
     if let Some(base) = &options.base_url
         && (!matches!(base.scheme(), "http" | "https") || base.host_str().is_none())
     {
@@ -104,22 +123,29 @@ pub fn analyze(sources: &[Source], options: &Options) -> Result<Report, Error> {
     }
     let mut report = Report::default();
     for source in sources {
+        let source_url = Url::parse(&source.name)
+            .ok()
+            .filter(|url| matches!(url.scheme(), "http" | "https"));
+        let filename = source_url
+            .as_ref()
+            .map_or(source.name.as_str(), |url| url.path());
         let is_map = match options.input_kind {
             InputKind::Map => true,
             InputKind::JavaScript => false,
             InputKind::Auto => {
-                let name = source.name.to_ascii_lowercase();
+                let name = filename.to_ascii_lowercase();
                 let extension = std::path::Path::new(&name)
                     .extension()
                     .and_then(|extension| extension.to_str());
                 !matches!(extension, Some("js" | "mjs" | "cjs" | "jsx" | "ts" | "tsx"))
                     && (name.ends_with(".map")
                         || name.ends_with(".json")
-                        || source
-                            .code
-                            .trim_start_matches('\u{feff}')
-                            .trim_start()
-                            .starts_with('{'))
+                        || (map_header.is_none()
+                            && source
+                                .code
+                                .trim_start_matches('\u{feff}')
+                                .trim_start()
+                                .starts_with('{')))
             }
         };
         if is_map {
@@ -132,31 +158,37 @@ pub fn analyze(sources: &[Source], options: &Options) -> Result<Report, Error> {
         let parsed = Parser::new(
             &allocator,
             &source.code,
-            SourceType::from_path(&source.name).unwrap_or(SourceType::tsx()),
+            SourceType::from_path(filename).unwrap_or(SourceType::tsx()),
         )
         .parse();
         for error in &parsed.errors {
             report.diagnostic(&source.name, error.to_string());
         }
         // Match actual comments, not sourceMappingURL text inside strings/templates/regexes.
-        // Like backendcaido, the final matching annotation is authoritative.
-        let annotation = parsed
-            .program
-            .comments
-            .iter()
-            .filter_map(|comment| {
-                let span = comment.content_span();
-                let text = source.code.get(span.start as usize..span.end as usize)?;
-                Some((annotation_url(text)?, comment.span))
-            })
-            .next_back();
+        // The final matching annotation is authoritative unless a header overrides it.
+        let annotation = map_header.map(|value| (value.trim(), None)).or_else(|| {
+            parsed
+                .program
+                .comments
+                .iter()
+                .filter_map(|comment| {
+                    let span = comment.content_span();
+                    let text = source.code.get(span.start as usize..span.end as usize)?;
+                    Some((annotation_url(text)?, Some(comment.span)))
+                })
+                .next_back()
+        });
         let Some((reference, span)) = annotation else {
             continue;
         };
         if reference.is_empty() {
+            if map_header.is_some() {
+                report.diagnostic(&source.name, "SourceMap response header is empty");
+            }
             continue;
         }
-        let location = LocationIndex::new(&source.code).location(&source.code, span);
+        let location =
+            span.and_then(|span| LocationIndex::new(&source.code).location(&source.code, span));
         if reference
             .get(..5)
             .is_some_and(|prefix| prefix.eq_ignore_ascii_case("data:"))

@@ -10,8 +10,9 @@ type annotation, or JSX element through the same interface. This makes jsexec us
 for investigating bundles, writing analysis scripts, and giving coding agents access
 to specific parts of a source file.
 
-Analysis runs on local files. JavaScript is parsed, never executed. Discovered URLs
-are returned as data; chunks, external maps, and missing source files are not fetched.
+JavaScript is parsed, never executed. Analysis accepts local files and stdin.
+The `sourcemaps` command also retrieves HTTP(S) scripts and maps. Chunk discovery
+returns URLs as data; it does not download assets.
 
 ## Contents
 
@@ -406,13 +407,25 @@ this extractor's scope.
 
 ## Source maps
 
-`sourcemaps` reads saved version-3 maps and JavaScript `sourceMappingURL` comments.
-It decodes base64 or percent-encoded inline maps, flattens indexed maps, and recovers
+`sourcemaps` accepts local files, stdin, and HTTP(S) URLs. It reads version-3 maps,
+JavaScript `sourceMappingURL` comments, and HTTP `SourceMap` response headers. It
+decodes base64 or percent-encoded inline maps, flattens indexed maps, and recovers
 original content from `sourcesContent`.
 
 ```sh
 # Report an external map reference relative to the script's original URL.
 jsexec sourcemaps bundle.js --base-url https://example.com/assets/bundle.js --list
+
+# Retrieve a script and its linked map, then recover embedded source files.
+jsexec sourcemaps https://example.com/assets/bundle.js --sources-dir recovered
+
+# Retrieve a map directly with authentication headers.
+jsexec sourcemaps https://example.com/assets/bundle.js.map \
+  -H "Authorization: Bearer $TOKEN" \
+  -H 'Cookie: session=example' --sources-dir authenticated-sources
+
+# Fetch the HTTP map referenced by a saved script.
+jsexec sourcemaps bundle.js --base-url https://example.com/assets/bundle.js --fetch
 
 # Read a saved map or an inline map embedded in a script.
 jsexec sourcemaps bundle.js.map
@@ -426,8 +439,13 @@ cat bundle.js.map | jsexec sourcemaps - --input-type map --strict
 ```
 
 Use `--input-type auto|js|map` to control detection; `json` is an alias for `map`.
-The final matching JavaScript annotation is authoritative. Annotation-like text
-inside strings, templates, regexes, or ordinary comments is ignored.
+The final matching JavaScript annotation is authoritative when no response header
+is present. `SourceMap` takes precedence over annotations; legacy `X-SourceMap` is
+accepted when `SourceMap` is absent. Header names are case-insensitive. This follows
+[ECMA-426's HTTP linking rules](https://tc39.es/ecma426/2024/#sec-linking-through-http-headers).
+Annotation-like text inside strings, templates, regexes, or ordinary comments is
+ignored. References resolve against the final script URL after redirects; original
+source paths resolve against the final downloaded map URL.
 
 The meaning of `--base-url` depends on the input:
 
@@ -436,14 +454,55 @@ The meaning of `--base-url` depends on the input:
 | JavaScript containing an annotation | The original script URL |
 | Saved source map | The original map URL |
 
-`--list` emits deduplicated external map references/URLs, including URL sections
-in indexed maps. External maps and sources without embedded content remain metadata;
-provide downloaded maps as local inputs to read them.
+For URL inputs, the downloaded response URL supplies the base automatically;
+`--base-url` applies to local files and stdin. A URL can point to either a script or
+a map. Automatic detection uses the URL path without its query string; use
+`--input-type map` for map endpoints with an ambiguous name or response body.
+
+### Retrieval options
+
+| Option | Behavior |
+| --- | --- |
+| `-H`, `--header 'NAME: VALUE'` | Add a request header; repeat for multiple headers, including repeated names |
+| `--fetch` | Download linked HTTP(S) maps for local files or stdin |
+| `--no-fetch` | Report linked maps without downloading them; URL inputs themselves are still retrieved |
+| `--list` | List external map references/URLs without downloading linked maps |
+| `--timeout SECONDS` | Request timeout, including its redirect chain; default 30, range 1–86400 |
+| `--max-bytes BYTES` | Maximum decompressed body size per response; default 52428800 (50 MiB) |
+
+URL inputs download linked maps by default. Local files and stdin remain offline
+unless `--fetch` is supplied; a relative reference then requires `--base-url`.
+`--fetch` and `--no-fetch` conflict. `--list` skips linked-map downloads even when
+`--fetch` is present. It emits deduplicated references, including URL sections in
+indexed maps. A direct map URL is still downloaded and parsed with `--list`.
+
+Custom headers apply to each explicitly supplied URL and same-origin linked maps.
+For local inputs with `--fetch`, the `--base-url` origin determines where headers
+may be sent. Without a base URL, an absolute map reference supplies that origin.
+A different scheme, host, or port counts as a different origin. All custom headers are removed when a redirect leaves that origin and remain removed
+for the rest of the redirect chain. Cross-origin map links are retrieved without
+custom headers; pass an authenticated map URL directly when it needs its own
+credentials. Headers are neither included in reports nor echoed in validation
+errors. There is no cookie jar; use an explicit `Cookie` header when needed.
+
+Retrieval follows at most 10 redirects per request, verifies HTTPS certificates,
+and rejects HTTPS-to-HTTP redirects and map links. URL credentials are rejected;
+use `--header` for authentication. Gzip, Brotli, and deflate responses are decoded
+before the size limit is checked. HTTP failures, timeouts, oversized bodies, and
+non-UTF-8 responses fail before reports or recovered files are written. Malformed
+maps produce diagnostics; `--strict` makes those diagnostics fail before writes.
+
+Only the primary linked map is downloaded. External indexed-map sections and
+sources without embedded content remain metadata; they are not recursively fetched.
+No map filenames are guessed when a script has no header or annotation.
 
 ### Reports and recovered files
 
 The JSON report contains `maps` and `diagnostics`. Each map records its `input`,
 `kind` (`file`, `inline`, or `external`), sources, and external section references.
+`file` includes directly supplied map URLs; a linked map keeps `external` after it
+is downloaded. Its `url` records the final map URL and `reference` retains the
+original link. Header references have no annotation location.
 Depending on the input, it also includes the original map reference/resolved URL,
 annotation location, and generated filename. Inline data payloads are not repeated.
 
@@ -543,7 +602,8 @@ still describe the original source bytes.
 
 All file inputs are UTF-8. Use `-` to read stdin; it can appear at most once in a
 multi-file command. `ast`, `query`, `chunks`, and `sourcemaps` accept multiple inputs.
-`node` and `format` accept one input.
+`node` and `format` accept one input. HTTP(S) URL inputs and request headers are
+supported only by `sourcemaps`.
 
 For `ast`, `query`, and `node`, recognized JavaScript/TypeScript extensions select
 the parser mode. Stdin and unknown extensions are parsed as TSX. Chunk and source
@@ -595,7 +655,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 | --- | --- |
 | `query` | `QueryIndex`, `Selector`, `RenderOptions`, `Relation` |
 | `chunks` | `Engine`, `Options`, `ChunkExtractor` |
-| `sourcemaps` | `analyze`, `Options`, `Report` |
+| `sourcemaps` | `analyze`, `analyze_response`, `Options`, `Report` |
 | `format` | `format`, `Options`, `InputKind` |
 | `source` | `Source`, `Location`, `Diagnostic`, `Error` |
 
@@ -616,7 +676,8 @@ cargo build --locked
 
 CLI input/output lives in `src/cli.rs` and `src/cli/`. Analysis and formatting live
 in separate library modules under `src/`. Integration tests cover library behavior,
-command-line output, pagination, diagnostics, and file writes.
+command-line output, pagination, diagnostics, file writes, and HTTP retrieval using
+local test servers. HTTP tests require permission to bind loopback sockets.
 
 Parsing and JavaScript generation use [Oxc](https://oxc.rs). HTML parsing and
 serialization use [html5ever](https://github.com/servo/html5ever).
@@ -636,6 +697,6 @@ serialization use [html5ever](https://github.com/servo/html5ever).
   dynamic import globs, or analyze executable inline HTML scripts. Unknown runtime
   values remain unresolved.
 - Source map recovery requires embedded content to write original files. Missing
-  sources and external map/section URLs remain metadata; VLQ position lookup is
-  not implemented.
+  sources and external indexed-map section URLs remain metadata. Retrieval follows
+  only the primary map link; VLQ position lookup is not implemented.
 - Formatting is separate from unminification, deobfuscation, and symbol renaming.
