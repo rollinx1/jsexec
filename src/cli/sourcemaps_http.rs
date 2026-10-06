@@ -175,9 +175,11 @@ pub(super) fn analyze_inputs(
                 Some(url),
             )
         } else {
-            let mut sources = read_sources(vec![PathBuf::from(input)])?;
+            let source = read_sources(vec![PathBuf::from(input)])?
+                .next()
+                .expect("one input")?;
             (
-                sources.remove(0),
+                source,
                 options.base_url.clone(),
                 None,
                 options.base_url.clone(),
@@ -191,6 +193,7 @@ pub(super) fn analyze_inputs(
             },
             header.as_deref(),
         )?;
+        drop(source);
         if !args.no_fetch && !args.list && (remote || args.fetch) {
             for map in &mut input_report.maps {
                 if map.kind != MapKind::External {

@@ -23,6 +23,7 @@ returns URLs as data; it does not download assets.
 - [Source maps](#source-maps)
 - [Formatting](#formatting)
 - [Input, output, and errors](#input-output-and-errors)
+- [Memory use](#memory-use)
 - [Library](#library)
 - [Development](#development)
 - [Limits](#limits)
@@ -626,6 +627,44 @@ require a clean report. Formatting always rejects JavaScript parser errors.
 | `1` | Analysis/I/O failure, strict-mode diagnostics, or a formatting check that differs |
 | `2` | CLI parsing failure, such as an unknown option or a missing argument |
 
+## Memory use
+
+Multi-file commands read and analyze one input at a time. AST indexes use shared
+strings and sorted flat field storage. Query pagination retains the requested page
+rather than a vector of every matching node ID, while still reporting exact counts.
+
+Each query still parses and indexes the entire current file. Result limits and
+field projections control output size; they do not make parsing incremental. The
+ESTree bridge serializes one top-level subtree at a time. A bundle inside one large
+function can therefore require a large intermediate subtree buffer.
+
+JSON and list reports are staged in a buffered temporary file before being copied
+to stdout or `--output`. This avoids accumulating reports and their serialized
+copies in memory, and keeps late analysis failures from producing partial output.
+The operating system's temporary directory must have room for the report; temporary
+storage can itself be backed by memory depending on the system. Unix temporary
+files are unlinked immediately; other platforms remove them on normal exit.
+
+Sourcemap parsing validates JSON while skipping unused `mappings`, `names`, and
+vendor fields without allocating their values. Embedded source strings are moved
+into the report. Recovered content remains in memory because the JSON report
+includes it; the CLI does not fetch missing sources to fill that content.
+
+To measure peak process memory on Linux:
+
+```sh
+cargo build --release --locked
+python3 scripts/benchmark_memory.py --binary target/release/jsexec
+
+# Compare two builds using identical generated inputs.
+python3 scripts/benchmark_memory.py --binary target/release/jsexec \
+  --compare-binary /path/to/previous/jsexec
+```
+
+The benchmark uses generated JavaScript, a bundle wrapped in one function, multiple
+files, and a map with embedded content. Results depend on node density and allocator
+behavior; file size alone is not a reliable predictor of memory use.
+
 ## Library
 
 The Rust library exposes the same analysis primitives without filesystem or network
@@ -663,7 +702,8 @@ For custom chunk detectors, implement `ChunkExtractor` and register it on an
 `Engine`. `Engine::new()` creates an empty registry; `Engine::default()` includes
 the built-in detectors. Selected extractors share one JavaScript parse per source;
 the engine handles asset validation, URL resolution, evidence grouping, and output
-ordering.
+ordering. `Engine::analyze_iter` accepts fallible iterators of owned or borrowed
+sources for callers that read inputs individually.
 
 ## Development
 

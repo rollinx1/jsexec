@@ -767,6 +767,7 @@ dependencies = [
  "oxc_ast",
  "oxc_ast_visit",
  "oxc_codegen",
+ "oxc_estree",
  "oxc_parser",
  "oxc_span",
  "oxc_syntax",

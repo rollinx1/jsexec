@@ -440,3 +440,9 @@ fn unusual_javascript_strings_do_not_prevent_node_access() {
         1
     );
 }
+
+#[test]
+fn compact_index_remains_send_and_sync_for_library_consumers() {
+    fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<QueryIndex<'static>>();
+}

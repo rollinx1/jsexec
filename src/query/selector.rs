@@ -412,7 +412,10 @@ fn compound(
     })?;
     let mut matches = vec![true; index.nodes.len()];
     for (id, node) in index.nodes.iter().enumerate() {
-        matches[id] = compound.kind.as_ref().is_none_or(|kind| node.kind == *kind)
+        matches[id] = compound
+            .kind
+            .as_ref()
+            .is_none_or(|kind| node.kind.as_ref() == kind)
             && compound.field.as_ref().is_none_or(|field| {
                 node.field
                     .as_deref()
@@ -482,7 +485,7 @@ fn edge_matches(actual: &str, expected: &str) -> bool {
             .is_some_and(|actual| part == "*" || part == actual)
     })
 }
-fn compare(value: &Value, attribute: &Attribute) -> bool {
+fn compare(value: super::Scalar<'_>, attribute: &Attribute) -> bool {
     let Expected::Value(expected) = &attribute.value else {
         let Expected::Regex(regex) = &attribute.value else {
             unreachable!()
@@ -519,10 +522,11 @@ fn compare(value: &Value, attribute: &Attribute) -> bool {
     }
 }
 
-fn equal(value: &Value, expected: &Value) -> bool {
-    if value.is_number() && expected.is_number() {
-        value.as_f64() == expected.as_f64()
-    } else {
-        value == expected
+fn equal(value: super::Scalar<'_>, expected: &Value) -> bool {
+    match value {
+        super::Scalar::Null => expected.is_null(),
+        super::Scalar::Bool(value) => expected.as_bool() == Some(value),
+        super::Scalar::Number(value) => expected.is_number() && value.as_f64() == expected.as_f64(),
+        super::Scalar::String(value) => expected.as_str() == Some(value),
     }
 }

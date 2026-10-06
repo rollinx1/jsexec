@@ -9,6 +9,7 @@ use std::path::PathBuf;
 use url::Url;
 
 mod format;
+mod output;
 mod query;
 mod sourcemaps_http;
 
@@ -155,9 +156,13 @@ fn chunks(args: ChunkArgs, engine: &Engine) -> Result<(), Box<dyn Error>> {
     engine.analyze(&[], &options)?;
     protect_output(&args.files, args.output.as_deref())?;
     let sources = read_sources(args.files)?;
-    let report = engine.analyze(&sources, &options)?;
+    let report = engine.analyze_iter(
+        sources.map(|source| source.map_err(|error| jsexec::source::Error(error.to_string()))),
+        &options,
+    )?;
     check_strict(args.strict, &report.diagnostics)?;
-    let mut result = Vec::new();
+    let mut staged = output::StagedOutput::new()?;
+    let result = staged.writer();
     if args.list {
         for diagnostic in &report.diagnostics {
             eprintln!("{}: {}", diagnostic.file, diagnostic.message);
@@ -166,19 +171,19 @@ fn chunks(args: ChunkArgs, engine: &Engine) -> Result<(), Box<dyn Error>> {
             writeln!(result, "{}", chunk.value)?;
         }
     } else {
-        serde_json::to_writer_pretty(&mut result, &report)?;
-        result.push(b'\n');
+        serde_json::to_writer_pretty(&mut *result, &report)?;
+        result.write_all(b"\n")?;
     }
-    write_output(args.output, result)
+    staged.commit(args.output)
 }
 
-fn read_sources(files: Vec<PathBuf>) -> Result<Vec<Source>, Box<dyn Error>> {
-    let stdin_count = files.iter().filter(|path| path.as_os_str() == "-").count();
-    if stdin_count > 1 {
+fn read_sources(
+    files: Vec<PathBuf>,
+) -> Result<impl Iterator<Item = Result<Source, Box<dyn Error>>>, Box<dyn Error>> {
+    if files.iter().filter(|path| path.as_os_str() == "-").count() > 1 {
         return Err("stdin ('-') can only be supplied once".into());
     }
-    let mut sources = Vec::new();
-    for path in files {
+    Ok(files.into_iter().map(|path| {
         let (name, code) = if path.as_os_str() == "-" {
             let mut code = String::new();
             io::stdin().read_to_string(&mut code)?;
@@ -188,9 +193,8 @@ fn read_sources(files: Vec<PathBuf>) -> Result<Vec<Source>, Box<dyn Error>> {
                 .map_err(|error| format!("cannot read '{}': {error}", path.display()))?;
             (path.to_string_lossy().into_owned(), code)
         };
-        sources.push(Source { name, code });
-    }
-    Ok(sources)
+        Ok(Source { name, code })
+    }))
 }
 
 fn protect_output(
@@ -275,7 +279,8 @@ fn source_maps(args: SourceMapArgs) -> Result<(), Box<dyn Error>> {
             .collect();
         protect_output(&extracted, args.output.as_deref())?;
     }
-    let mut result = Vec::new();
+    let mut staged = output::StagedOutput::new()?;
+    let result = staged.writer();
     if args.list {
         for diagnostic in &report.diagnostics {
             eprintln!("{}: {}", diagnostic.file, diagnostic.message);
@@ -295,10 +300,10 @@ fn source_maps(args: SourceMapArgs) -> Result<(), Box<dyn Error>> {
             writeln!(result, "{reference}")?;
         }
     } else {
-        serde_json::to_writer_pretty(&mut result, &report)?;
-        result.push(b'\n');
+        serde_json::to_writer_pretty(&mut *result, &report)?;
+        result.write_all(b"\n")?;
     }
-    write_output(args.output, result)
+    staged.commit(args.output)
 }
 
 fn write_output(output: Option<PathBuf>, result: Vec<u8>) -> Result<(), Box<dyn Error>> {

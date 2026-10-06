@@ -1,20 +1,61 @@
 use super::{Report, SectionReference, SourceEntry, SourceMap, resolve_map_url};
-use serde_json::Value;
+use serde::de::{Deserialize, Deserializer, IgnoredAny, MapAccess, Visitor};
+use serde_json::{Value, value::RawValue};
+use std::collections::BTreeMap;
+use std::fmt;
 use url::Url;
 
+// Keep only borrowed slices for fields recovery uses. Large `mappings`, `names`,
+// and vendor extensions are validated and skipped without allocating their values.
+struct RawFields<'a>(BTreeMap<String, &'a RawValue>);
+impl<'de> Deserialize<'de> for RawFields<'de> {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct FieldsVisitor;
+        impl<'de> Visitor<'de> for FieldsVisitor {
+            type Value = RawFields<'de>;
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("a source map object")
+            }
+            fn visit_map<M: MapAccess<'de>>(self, mut map: M) -> Result<Self::Value, M::Error> {
+                let mut fields = BTreeMap::new();
+                while let Some(key) = map.next_key::<String>()? {
+                    if matches!(
+                        key.as_str(),
+                        "version"
+                            | "file"
+                            | "sections"
+                            | "sources"
+                            | "sourceRoot"
+                            | "sourcesContent"
+                            | "ignoreList"
+                            | "x_google_ignoreList"
+                            | "map"
+                            | "url"
+                    ) {
+                        fields.insert(key, map.next_value::<&'de RawValue>()?);
+                    } else {
+                        map.next_value::<IgnoredAny>()?;
+                    }
+                }
+                Ok(RawFields(fields))
+            }
+        }
+        deserializer.deserialize_map(FieldsVisitor)
+    }
+}
+
 pub(super) fn parse(json: &str, map: &mut SourceMap, report: &mut Report) {
-    let value = match serde_json::from_str::<Value>(json.trim_start_matches('\u{feff}')) {
+    let raw = match serde_json::from_str::<&RawValue>(json.trim_start_matches('\u{feff}')) {
         Ok(value) => value,
         Err(error) => {
             report.diagnostic(&map.input, format!("invalid source map JSON: {error}"));
             return;
         }
     };
-    map.generated_file = value.get("file").and_then(Value::as_str).map(str::to_owned);
-    flatten(&value, &[], map, report);
+    flatten(raw, &[], map, report);
 }
 
-fn flatten(value: &Value, section: &[usize], map: &mut SourceMap, report: &mut Report) {
+fn flatten(raw: &RawValue, section: &[usize], map: &mut SourceMap, report: &mut Report) {
     let input = map.input.clone();
     let issue = |report: &mut Report, message: String| {
         report.diagnostic(&input, format!("section {section:?}: {message}"))
@@ -23,16 +64,25 @@ fn flatten(value: &Value, section: &[usize], map: &mut SourceMap, report: &mut R
         issue(report, "source map section nesting exceeds 32".into());
         return;
     }
-    let Some(object) = value.as_object() else {
+    let Ok(RawFields(object)) = serde_json::from_str::<RawFields<'_>>(raw.get()) else {
         issue(report, "source map must be an object".into());
         return;
     };
-    if object.get("version").and_then(Value::as_u64) != Some(3) {
+    if section.is_empty() {
+        map.generated_file = object
+            .get("file")
+            .and_then(|raw| serde_json::from_str::<String>(raw.get()).ok());
+    }
+    if object
+        .get("version")
+        .and_then(|value| value.get().trim().parse::<u64>().ok())
+        != Some(3)
+    {
         issue(report, "source map version must be 3".into());
         return;
     }
     if let Some(sections) = object.get("sections") {
-        let Some(sections) = sections.as_array() else {
+        let Ok(sections) = serde_json::from_str::<Vec<&RawValue>>(sections.get()) else {
             issue(report, "sections must be an array".into());
             return;
         };
@@ -45,19 +95,22 @@ fn flatten(value: &Value, section: &[usize], map: &mut SourceMap, report: &mut R
         for (index, child) in sections.iter().enumerate() {
             let mut child_section = section.to_vec();
             child_section.push(index);
-            if let Some(embedded) = child.get("map") {
-                // Section maps are complete maps; sourceRoot is not inherited (ECMA-426).
+            let fields = serde_json::from_str::<RawFields<'_>>(child.get()).ok();
+            if let Some(embedded) = fields.as_ref().and_then(|fields| fields.0.get("map")) {
                 flatten(embedded, &child_section, map, report);
-            } else if let Some(reference) = child.get("url").and_then(Value::as_str) {
-                // Keep legacy URL sections visible, without downloading them.
+            } else if let Some(reference) = fields
+                .as_ref()
+                .and_then(|fields| fields.0.get("url"))
+                .and_then(|raw| serde_json::from_str::<String>(raw.get()).ok())
+            {
                 let base = map.url.as_deref().and_then(|url| Url::parse(url).ok());
-                let url = resolve_map_url(reference, base.as_ref());
+                let url = resolve_map_url(&reference, base.as_ref());
                 if let Err(error) = &url {
                     issue(report, error.to_string());
                 }
                 map.external_sections.push(SectionReference {
                     section: child_section,
-                    reference: reference.into(),
+                    reference,
                     url: url.ok().flatten().map(|url| url.to_string()),
                 });
             } else {
@@ -66,19 +119,42 @@ fn flatten(value: &Value, section: &[usize], map: &mut SourceMap, report: &mut R
         }
         return;
     }
-    let Some(sources) = object.get("sources").and_then(Value::as_array) else {
+    let Some(sources) = object
+        .get("sources")
+        .and_then(|value| serde_json::from_str::<Vec<Value>>(value.get()).ok())
+    else {
         issue(report, "missing sources array".into());
         return;
     };
-    let root = match object.get("sourceRoot") {
-        Some(Value::String(root)) => Some(root.as_str()),
+    let decode = |name: &str| {
+        object
+            .get(name)
+            .map(|value| serde_json::from_str::<Value>(value.get()))
+            .transpose()
+    };
+    let root_value = match decode("sourceRoot") {
+        Ok(value) => value,
+        Err(error) => {
+            issue(report, format!("invalid sourceRoot JSON: {error}"));
+            return;
+        }
+    };
+    let root = match root_value {
+        Some(Value::String(root)) => Some(root),
         None | Some(Value::Null) => None,
         Some(_) => {
             issue(report, "sourceRoot must be a string or null".into());
             None
         }
     };
-    let contents = match object.get("sourcesContent") {
+    let content_value = match decode("sourcesContent") {
+        Ok(value) => value,
+        Err(error) => {
+            issue(report, format!("invalid sourcesContent JSON: {error}"));
+            return;
+        }
+    };
+    let contents = match content_value {
         Some(Value::Array(contents)) => {
             if contents.len() != sources.len() {
                 issue(
@@ -101,18 +177,19 @@ fn flatten(value: &Value, section: &[usize], map: &mut SourceMap, report: &mut R
     let ignored = object
         .get("ignoreList")
         .or_else(|| object.get("x_google_ignoreList"))
-        .and_then(Value::as_array);
-    for (index, source) in sources.iter().enumerate() {
+        .and_then(|value| serde_json::from_str::<Vec<Value>>(value.get()).ok());
+    let mut contents = contents.unwrap_or_default().into_iter();
+    for (index, source) in sources.into_iter().enumerate() {
         let path = match source {
-            Value::String(path) => Some(path.clone()),
+            Value::String(path) => Some(path),
             Value::Null => None,
             _ => {
                 issue(report, format!("source {index} is not a string or null"));
                 None
             }
         };
-        let content = match contents.and_then(|contents| contents.get(index)) {
-            Some(Value::String(content)) => Some(content.clone()),
+        let content = match contents.next() {
+            Some(Value::String(content)) => Some(content),
             None | Some(Value::Null) => None,
             Some(_) => {
                 issue(
@@ -124,15 +201,15 @@ fn flatten(value: &Value, section: &[usize], map: &mut SourceMap, report: &mut R
         };
         let resolved_url = path
             .as_deref()
-            .and_then(|path| resolve_source(path, root, map.url.as_deref()));
+            .and_then(|path| resolve_source(path, root.as_deref(), map.url.as_deref()));
         map.sources.push(SourceEntry {
             index,
             section: section.to_vec(),
             path,
-            source_root: root.map(str::to_owned),
+            source_root: root.clone(),
             resolved_url,
             content,
-            ignored: ignored.is_some_and(|values| {
+            ignored: ignored.as_ref().is_some_and(|values| {
                 values
                     .iter()
                     .any(|value| value.as_u64() == Some(index as u64))

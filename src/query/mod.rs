@@ -11,22 +11,48 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 
+// Repeated schema names, kinds, and scalar strings share storage within an index.
+// Fields use sorted flat slices instead of a separately allocated tree per node.
+pub(super) struct Fields(Box<[(std::sync::Arc<str>, Field)]>);
+impl Fields {
+    fn get(&self, key: &str) -> Option<&Field> {
+        self.0
+            .binary_search_by(|(name, _)| name.as_ref().cmp(key))
+            .ok()
+            .map(|i| &self.0[i].1)
+    }
+    fn iter(&self) -> impl Iterator<Item = &(std::sync::Arc<str>, Field)> {
+        self.0.iter()
+    }
+    fn keys(&self) -> impl Iterator<Item = &str> {
+        self.0.iter().map(|(key, _)| key.as_ref())
+    }
+    fn values(&self) -> impl Iterator<Item = &Field> {
+        self.0.iter().map(|(_, value)| value)
+    }
+    fn len(&self) -> usize {
+        self.0.len()
+    }
+}
+impl<'a> IntoIterator for &'a Fields {
+    type Item = &'a (std::sync::Arc<str>, Field);
+    type IntoIter = std::slice::Iter<'a, (std::sync::Arc<str>, Field)>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.iter()
+    }
+}
 pub(super) enum Field {
-    Scalar(Value),
+    Null,
+    Bool(bool),
+    Number(serde_json::Number),
+    String(std::sync::Arc<str>),
     Node(usize),
-    Array(Vec<Field>),
-    Object(BTreeMap<String, Field>),
+    Array(Box<[Field]>),
+    Object(Fields),
 }
 impl Field {
-    fn as_str(&self) -> Option<&str> {
-        if let Self::Scalar(Value::String(value)) = self {
-            Some(value)
-        } else {
-            None
-        }
-    }
     fn as_u32(&self) -> Option<u32> {
-        if let Self::Scalar(value) = self {
+        if let Self::Number(value) = self {
             value.as_u64().and_then(|value| value.try_into().ok())
         } else {
             None
@@ -34,12 +60,12 @@ impl Field {
     }
 }
 pub(super) struct IndexedNode {
-    kind: String,
+    kind: std::sync::Arc<str>,
     span: Span,
     parent: Option<usize>,
-    field: Option<String>,
-    children: Vec<usize>,
-    fields: BTreeMap<String, Field>,
+    field: Option<std::sync::Arc<str>>,
+    children: Box<[usize]>,
+    fields: Fields,
 }
 
 /// Owned compact AST metadata; the source text is borrowed, never modified.
@@ -115,7 +141,7 @@ pub enum Relation {
 
 impl<'a> QueryIndex<'a> {
     pub fn parse(source: &'a Source) -> Result<Self, Error> {
-        let (json, diagnostics) = {
+        let (nodes, root, diagnostics) = {
             let allocator = Allocator::default();
             let parsed = Parser::new(
                 &allocator,
@@ -131,9 +157,9 @@ impl<'a> QueryIndex<'a> {
                     message: error.to_string(),
                 })
                 .collect();
-            (parsed.program.to_estree_ts_json(false), diagnostics)
+            let (nodes, root) = index::build_program(&parsed.program)?;
+            (nodes, root, diagnostics)
         };
-        let (nodes, root) = index::build(&json)?;
         let mut order = Vec::with_capacity(nodes.len());
         let mut stack = vec![root];
         while let Some(node) = stack.pop() {
@@ -160,9 +186,9 @@ impl<'a> QueryIndex<'a> {
     pub fn kinds(&self) -> Vec<Kind> {
         let mut kinds: BTreeMap<&str, (usize, std::collections::BTreeSet<&str>)> = BTreeMap::new();
         for node in &self.nodes {
-            let (count, fields) = kinds.entry(&node.kind).or_default();
+            let (count, fields) = kinds.entry(node.kind.as_ref()).or_default();
             *count += 1;
-            fields.extend(node.fields.keys().map(String::as_str));
+            fields.extend(node.fields.keys());
         }
         kinds
             .into_iter()
@@ -182,13 +208,8 @@ impl<'a> QueryIndex<'a> {
         render: &RenderOptions,
     ) -> Result<Page, Error> {
         let matches = selector::evaluate(selector, self)?;
-        let ids: Vec<_> = self
-            .order
-            .iter()
-            .copied()
-            .filter(|id| matches[*id])
-            .collect();
-        self.page(&ids, offset, limit, render)
+        let ids = self.order.iter().copied().filter(|id| matches[*id]);
+        self.page_iter(ids, offset, limit, render)
     }
 
     pub fn related(
@@ -234,7 +255,7 @@ impl<'a> QueryIndex<'a> {
                 let mut current = Some(id);
                 while let Some(id) = current {
                     if matches!(
-                        self.nodes[id].kind.as_str(),
+                        self.nodes[id].kind.as_ref(),
                         "Program"
                             | "FunctionDeclaration"
                             | "FunctionExpression"
@@ -271,16 +292,27 @@ impl<'a> QueryIndex<'a> {
         limit: usize,
         options: &RenderOptions,
     ) -> Result<Page, Error> {
-        let nodes = ids
-            .iter()
-            .skip(offset)
-            .take(limit)
-            .map(|id| self.render(*id, options))
-            .collect::<Result<Vec<_>, _>>()?;
+        self.page_iter(ids.iter().copied(), offset, limit, options)
+    }
+    fn page_iter(
+        &self,
+        ids: impl Iterator<Item = usize>,
+        offset: usize,
+        limit: usize,
+        options: &RenderOptions,
+    ) -> Result<Page, Error> {
+        let mut nodes = Vec::new();
+        let mut match_count = 0;
+        for (position, id) in ids.enumerate() {
+            if position >= offset && nodes.len() < limit {
+                nodes.push(self.render(id, options)?);
+            }
+            match_count = position + 1;
+        }
         let end = offset.saturating_add(nodes.len());
-        let has_more = end < ids.len();
+        let has_more = end < match_count;
         Ok(Page {
-            match_count: ids.len(),
+            match_count,
             offset,
             has_more,
             next_offset: (has_more && limit > 0).then_some(end),
@@ -300,7 +332,7 @@ impl<'a> QueryIndex<'a> {
         if options.fields.is_empty() {
             for (name, value) in &node.fields {
                 fields.insert(
-                    name.clone(),
+                    name.to_string(),
                     self.field_json(value, name, options, &mut truncated_fields),
                 );
             }
@@ -333,13 +365,13 @@ impl<'a> QueryIndex<'a> {
         truncated_fields.dedup();
         Ok(Node {
             id: format!("n{id}"),
-            kind: node.kind.clone(),
+            kind: node.kind.to_string(),
             location: self
                 .locations
                 .location(&self.source.code, node.span)
                 .ok_or_else(|| Error("invalid AST location".into()))?,
             parent: node.parent.map(|id| format!("n{id}")),
-            field: node.field.clone(),
+            field: node.field.as_deref().map(str::to_owned),
             child_count: node.children.len(),
             code,
             code_truncated,
@@ -356,15 +388,19 @@ impl<'a> QueryIndex<'a> {
         truncated: &mut Vec<String>,
     ) -> Value {
         match field {
-            Field::Node(id) => json!({"node":format!("n{id}"), "kind":self.nodes[*id].kind}),
-            Field::Scalar(Value::String(value)) => {
+            Field::Node(id) => {
+                json!({"node":format!("n{id}"), "kind":self.nodes[*id].kind.as_ref()})
+            }
+            Field::String(value) => {
                 let (value, cut) = truncate(value, options.max_value);
                 if cut {
                     truncated.push(path.into());
                 }
                 Value::String(value)
             }
-            Field::Scalar(value) => value.clone(),
+            Field::Null => Value::Null,
+            Field::Bool(value) => Value::Bool(*value),
+            Field::Number(value) => Value::Number(value.clone()),
             Field::Array(values) => {
                 if values.len() > options.max_items {
                     truncated.push(path.into());
@@ -390,7 +426,7 @@ impl<'a> QueryIndex<'a> {
                         .take(options.max_items)
                         .map(|(key, value)| {
                             (
-                                key.clone(),
+                                key.to_string(),
                                 self.field_json(
                                     value,
                                     &format!("{path}.{key}"),
@@ -413,9 +449,19 @@ impl<'a> QueryIndex<'a> {
     ) -> Value {
         match value {
             Atom::Field(field) => self.field_json(field, path, options, truncated),
-            Atom::Node(id) => json!({"node":format!("n{id}"), "kind":self.nodes[*id].kind}),
+            Atom::Node(id) => {
+                json!({"node":format!("n{id}"), "kind":self.nodes[*id].kind.as_ref()})
+            }
             Atom::Scalar(value) => {
-                self.field_json(&Field::Scalar(value.clone()), path, options, truncated)
+                if let Value::String(value) = value {
+                    let (text, cut) = truncate(value, options.max_value);
+                    if cut {
+                        truncated.push(path.into());
+                    }
+                    Value::String(text)
+                } else {
+                    value.clone()
+                }
             }
         }
     }
@@ -424,7 +470,11 @@ impl<'a> QueryIndex<'a> {
             let node = &self.nodes[id];
             let value = match attribute {
                 "id" => Value::String(format!("n{id}")),
-                "field" => node.field.clone().map(Value::String).unwrap_or(Value::Null),
+                "field" => node
+                    .field
+                    .as_deref()
+                    .map(|value| Value::String(value.into()))
+                    .unwrap_or(Value::Null),
                 "text" => Value::String(
                     self.source.code[node.span.start as usize..node.span.end as usize].into(),
                 ),
@@ -492,10 +542,44 @@ pub(super) enum Atom<'a> {
     Node(usize),
     Scalar(Value),
 }
+#[derive(Clone, Copy)]
+pub(super) enum Scalar<'a> {
+    Null,
+    Bool(bool),
+    Number(&'a serde_json::Number),
+    String(&'a str),
+}
+impl<'a> Scalar<'a> {
+    fn as_str(self) -> Option<&'a str> {
+        if let Self::String(value) = self {
+            Some(value)
+        } else {
+            None
+        }
+    }
+    fn as_f64(self) -> Option<f64> {
+        if let Self::Number(value) = self {
+            value.as_f64()
+        } else {
+            None
+        }
+    }
+    fn is_string(self) -> bool {
+        matches!(self, Self::String(_))
+    }
+}
 impl Atom<'_> {
-    fn scalar(&self) -> Option<&Value> {
+    fn scalar(&self) -> Option<Scalar<'_>> {
         match self {
-            Self::Field(Field::Scalar(value)) | Self::Scalar(value) => Some(value),
+            Self::Field(Field::Null) | Self::Scalar(Value::Null) => Some(Scalar::Null),
+            Self::Field(Field::Bool(value)) | Self::Scalar(Value::Bool(value)) => {
+                Some(Scalar::Bool(*value))
+            }
+            Self::Field(Field::Number(value)) | Self::Scalar(Value::Number(value)) => {
+                Some(Scalar::Number(value))
+            }
+            Self::Field(Field::String(value)) => Some(Scalar::String(value)),
+            Self::Scalar(Value::String(value)) => Some(Scalar::String(value)),
             _ => None,
         }
     }

@@ -1,8 +1,10 @@
-use super::{check_strict, protect_output, read_sources, write_output};
+use super::output::StagedOutput;
+use super::{check_strict, protect_output, read_sources};
 use clap::{Args, ValueEnum};
 use jsexec::query::{Page, QueryIndex, Relation, RenderOptions, Selector};
-use serde::Serialize;
+use serde::{Serialize, Serializer, ser::SerializeSeq};
 use std::error::Error;
+use std::io::Write;
 use std::path::PathBuf;
 
 #[derive(Args)]
@@ -105,18 +107,40 @@ struct NodeReport<'a> {
     page: Page,
 }
 
+#[derive(Serialize)]
+struct AstReport<'a> {
+    file: &'a str,
+    hash: &'a str,
+    partial: bool,
+    diagnostics: &'a [jsexec::source::Diagnostic],
+    node_count: usize,
+    root: String,
+    kinds: Vec<jsexec::query::Kind>,
+}
+
 pub(super) fn ast(args: AstArgs) -> Result<(), Box<dyn Error>> {
     protect_output(&args.files, args.output.as_deref())?;
     let sources = read_sources(args.files)?;
-    let mut reports = Vec::new();
-    for source in &sources {
-        let index = QueryIndex::parse(source)?;
+    let mut output = StagedOutput::new()?;
+    let mut serializer = serde_json::Serializer::pretty(output.writer());
+    let mut reports = serializer.serialize_seq(None)?;
+    for source in sources {
+        let source = source?;
+        let index = QueryIndex::parse(&source)?;
         check_strict(args.strict, &index.diagnostics)?;
-        reports.push(serde_json::json!({"file": source.name, "hash": index.hash,
-            "partial": !index.diagnostics.is_empty(), "diagnostics": index.diagnostics,
-            "node_count": index.node_count(), "root": index.root_id(), "kinds": index.kinds()}));
+        reports.serialize_element(&AstReport {
+            file: &source.name,
+            hash: &index.hash,
+            partial: !index.diagnostics.is_empty(),
+            diagnostics: &index.diagnostics,
+            node_count: index.node_count(),
+            root: index.root_id(),
+            kinds: index.kinds(),
+        })?;
     }
-    output(args.output, &reports)
+    reports.end()?;
+    output.writer().write_all(b"\n")?;
+    output.commit(args.output)
 }
 
 pub(super) fn query(args: QueryArgs) -> Result<(), Box<dyn Error>> {
@@ -151,9 +175,12 @@ fn execute(
         max_items: args.max_items,
         fields: args.fields.clone(),
     };
-    let mut reports = Vec::new();
-    for source in &sources {
-        let index = QueryIndex::parse(source)?;
+    let mut output = StagedOutput::new()?;
+    let mut serializer = serde_json::Serializer::pretty(output.writer());
+    let mut reports = serializer.serialize_seq(None)?;
+    for source in sources {
+        let source = source?;
+        let index = QueryIndex::parse(&source)?;
         check_strict(args.strict, &index.diagnostics)?;
         if let Some(hash) = &args.expect_hash
             && *hash != index.hash
@@ -171,13 +198,9 @@ fn execute(
             diagnostics: &index.diagnostics,
             page: action(&index, &args, &render)?,
         };
-        reports.push(serde_json::to_value(report)?);
+        reports.serialize_element(&report)?;
     }
-    output(args.output, &reports)
-}
-
-fn output(path: Option<PathBuf>, reports: &impl Serialize) -> Result<(), Box<dyn Error>> {
-    let mut bytes = serde_json::to_vec_pretty(reports)?;
-    bytes.push(b'\n');
-    write_output(path, bytes)
+    reports.end()?;
+    output.writer().write_all(b"\n")?;
+    output.commit(args.output)
 }

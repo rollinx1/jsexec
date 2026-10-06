@@ -366,3 +366,45 @@ fn response_header_selects_javascript_for_extensionless_blocks_and_reports_empty
     assert_eq!(report.diagnostics.len(), 1);
     assert!(report.diagnostics[0].message.contains("header is empty"));
 }
+
+#[test]
+fn unused_map_fields_are_skipped_but_their_json_is_still_validated() {
+    let map = format!(
+        r#"{{"version":3,"sources":["a.js","empty.js"],"sourcesContent":["content",""],"mappings":"{}","names":["unused"],"vendor":{{"unused":"large"}}}}"#,
+        "AAAA;".repeat(100_000)
+    );
+    let report = analyze("app.map", &map, None);
+    assert!(report.diagnostics.is_empty());
+    assert_eq!(report.embedded_count(), 2);
+    assert_eq!(
+        report.maps[0].sources[0].content.as_deref(),
+        Some("content")
+    );
+    assert_eq!(report.maps[0].sources[1].content.as_deref(), Some(""));
+    let report = analyze(
+        "bad.map",
+        r#"{"version":3,"sources":[],"mappings":"bad\q"}"#,
+        None,
+    );
+    assert!(report.maps[0].sources.is_empty());
+    assert!(
+        report.diagnostics[0]
+            .message
+            .contains("invalid source map JSON")
+    );
+}
+
+#[test]
+fn borrowed_map_fields_preserve_last_duplicate_values_and_partial_recovery() {
+    let report = analyze(
+        "app.map",
+        r#"{"version":2,"version":3,"sources":["old"],"sources":["a.js",null,"bad.js"],"sourcesContent":["one","",42],"ignoreList":["invalid",0],"unused":true}"#,
+        None,
+    );
+    assert_eq!(report.maps[0].sources.len(), 3);
+    assert_eq!(report.maps[0].sources[0].content.as_deref(), Some("one"));
+    assert!(report.maps[0].sources[0].ignored);
+    assert_eq!(report.maps[0].sources[1].content.as_deref(), Some(""));
+    assert!(report.maps[0].sources[2].content.is_none());
+    assert_eq!(report.diagnostics.len(), 1);
+}

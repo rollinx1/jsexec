@@ -7,7 +7,8 @@ Oxc dependencies are pinned together.
 ## Structure
 
 - `src/main.rs`: thin entrypoint and exit status.
-- `src/cli.rs`: Clap subcommands, input reading, output writing.
+- `src/cli.rs`: Clap subcommands, lazy per-file input reading, output writing.
+- `src/cli/output.rs`: bounded buffered temporary reports, committed after successful analysis.
 - `src/lib.rs`: reusable analysis modules with no filesystem or network operations.
 - `src/source.rs`: shared input, error, diagnostic, and source-location types.
 - `src/chunks/mod.rs`: extractor registry, one JavaScript parse per source, source
@@ -17,8 +18,9 @@ Oxc dependencies are pinned together.
 - `src/chunks/manifest.rs`: JSON manifests and HTML script/preload references.
 - `src/sourcemaps/`: JavaScript comment annotations, inline data-URI decoding,
   regular/indexed version-3 map parsing, original content and missing-source metadata.
-- `src/query/`: generic ESTree arena index, CSS-style selector grammar/evaluation,
-  source hash, bounded evidence rendering, and AST navigation.
+- `src/query/`: compact ESTree arena with interned strings and sorted flat fields,
+  CSS-style selectors, source hash, bounded evidence rendering, and AST navigation.
+- `scripts/benchmark_memory.py`: Linux peak-RSS benchmarks with optional binary comparison.
 - `src/cli/sourcemaps_http.rs`: HTTP retrieval, scoped request headers, redirects, limits.
 - `src/cli/query.rs`: AST discovery/query/node commands and pagination/projection.
 - `src/format/`: Oxc JS/TS/JSX/TSX formatting and html5ever HTML serialization.
@@ -65,9 +67,22 @@ Sourcemap retrieval is limited to explicit URL inputs and their primary map link
 or an explicit `--fetch` for local inputs. Document static-evaluation limits in
 README. Shared source types remain re-exported from `chunks` for compatibility.
 
+Read and analyze inputs individually. Serialize reports directly to a buffered
+private temporary file, then copy to stdout/output after all analysis succeeds.
+Preserve empty stdout and existing outputs on late input/strict/hash failures.
+Temporary files are unlinked immediately on Unix and cleaned on normal exit elsewhere.
+Do not accumulate JSON report values or a second serialized output buffer. Chunk
+`Engine::analyze_iter` groups evidence across owned/borrowed inputs without retaining
+source text. Sourcemap parsing borrows raw fields, skips unused mapping/name/vendor
+values, validates JSON, and moves recovered strings rather than cloning contents.
+
 Generic querying uses Oxc's TypeScript-inclusive ESTree serialization, not a list
-of hand-picked node kinds or domain detectors. Keep arbitrary fields and parent/edge
-relationships accessible. IDs are file-local and tied to unchanged input and parser
+of hand-picked node kinds or domain detectors. Build one top-level subtree at a
+time; the pinned serializer cannot accept a streaming sink. Keep Program fields,
+TS span rules, post-order IDs, directive/hashbang handling, and all node fields
+equivalent to whole-Program serialization; test this equivalence when updating Oxc.
+Use shared strings and flat sorted fields; retain `Send + Sync` on the public index.
+Keep arbitrary fields and parent/edge relationships accessible. IDs are file-local and tied to unchanged input and parser
 version; hashes detect source changes. Preserve unpaired UTF-16 strings explicitly.
 Keep selectors/evaluation bounded, diagnostics visible, and rendering truncation
 explicit. `context` is syntactic, not scope/data-flow analysis. Query commands return

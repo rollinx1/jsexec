@@ -42,8 +42,9 @@ pub(super) fn run(args: FormatArgs) -> Result<(), Box<dyn Error>> {
         return Err("--write requires an input file; use --output to save stdin".into());
     }
     protect_output(std::slice::from_ref(&args.file), args.output.as_deref())?;
-    let sources = read_sources(vec![args.file.clone()])?;
-    let source = &sources[0];
+    let source = read_sources(vec![args.file.clone()])?
+        .next()
+        .expect("one input")?;
     let options = Options {
         input_kind: match args.input_type {
             Format::Auto => InputKind::Auto,
@@ -56,7 +57,7 @@ pub(super) fn run(args: FormatArgs) -> Result<(), Box<dyn Error>> {
         single_quote: args.single_quote,
         indent_width: args.indent_width.into(),
     };
-    let formatted = format::format(source, &options)?;
+    let formatted = format::format(&source, &options)?;
     if args.check {
         if formatted != source.code {
             return Err(format!("'{}' needs formatting", source.name).into());

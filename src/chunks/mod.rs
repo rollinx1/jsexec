@@ -10,6 +10,7 @@ use oxc_ast::ast::Program;
 use oxc_parser::Parser;
 use oxc_span::{SourceType, Span};
 use serde::Serialize;
+use std::borrow::Borrow;
 use std::collections::{BTreeMap, BTreeSet};
 use url::Url;
 
@@ -122,6 +123,16 @@ impl Engine {
     }
 
     pub fn analyze(&self, sources: &[Source], options: &Options) -> Result<Report, Error> {
+        self.analyze_iter(sources.iter().map(Ok), options)
+    }
+
+    /// Consume one owned or borrowed source at a time, retaining grouped evidence.
+    /// Input errors stop analysis before a report is returned.
+    pub fn analyze_iter<S: Borrow<Source>>(
+        &self,
+        sources: impl IntoIterator<Item = Result<S, Error>>,
+        options: &Options,
+    ) -> Result<Report, Error> {
         let names = self.extractor_names();
         for name in &options.extractors {
             if !names.contains(&name.as_str()) {
@@ -139,6 +150,8 @@ impl Engine {
         let mut report = Report::default();
         let mut grouped: BTreeMap<String, BTreeSet<Evidence>> = BTreeMap::new();
         for source in sources {
+            let source = source?;
+            let source = source.borrow();
             let kind = input_kind(source, options.input_kind);
             let locations = LocationIndex::new(&source.code);
             let allocator = Allocator::default();

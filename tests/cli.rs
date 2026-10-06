@@ -587,3 +587,52 @@ fn formatting_rejects_conflicting_options_and_accidental_input_overwrite() {
         assert_eq!(std::fs::read_to_string(&destination).unwrap(), "original");
     }
 }
+
+#[test]
+fn late_input_failures_preserve_output_and_emit_no_partial_stdout() {
+    let workspace = Workspace::new();
+    let first = workspace.file("first.js", "fetch('/first');");
+    let bad = workspace.file("bad.js", "const = ;");
+    let missing = workspace
+        .0
+        .join("missing.js")
+        .to_string_lossy()
+        .into_owned();
+    let saved = workspace.file("saved.json", "existing output");
+    for command in ["ast", "query", "chunks"] {
+        for second in [&bad, &missing] {
+            let mut args = vec![command];
+            if command == "query" {
+                args.push("CallExpression");
+            }
+            args.extend([first.as_str(), second.as_str(), "--strict"]);
+            let output = run(&args, "");
+            assert!(!output.status.success(), "{args:?}");
+            assert!(output.stdout.is_empty());
+            args.extend(["--output", &saved]);
+            let output = run(&args, "");
+            assert!(!output.status.success());
+            assert_eq!(std::fs::read_to_string(&saved).unwrap(), "existing output");
+        }
+    }
+}
+
+#[test]
+fn streamed_reports_remain_valid_for_large_pages_and_mixed_stdin_inputs() {
+    let workspace = Workspace::new();
+    let file = workspace.file("large.js", &"fetch('/file');\n".repeat(1000));
+    let output = run(
+        &["query", "CallExpression", &file, "-", "--limit", "1000"],
+        "fetch('/stdin');",
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report[0]["match_count"], 1000);
+    assert_eq!(report[0]["nodes"].as_array().unwrap().len(), 1000);
+    assert_eq!(report[1]["match_count"], 1);
+    assert_eq!(report[1]["file"], "<stdin>");
+}
